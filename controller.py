@@ -482,7 +482,7 @@ def parse_agent_json(text: str) -> Dict[str, Any]:
     return data
 
 
-def validate_agent_shape(obj: Dict[str, Any]) -> None:
+def _fallback_validate_agent_shape(obj: Dict[str, Any]) -> None:
     def req(k: str, t: Any) -> None:
         if k not in obj:
             raise ValueError(f"Missing required key: {k}")
@@ -514,7 +514,21 @@ def validate_agent_shape(obj: Dict[str, Any]) -> None:
             raise ValueError("plan_updates.notes must be string")
 
 
-def validate_fuzzy_shape(obj: Dict[str, Any]) -> None:
+def validate_agent_shape(obj: Dict[str, Any]) -> None:
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        print("Warning: 'jsonschema' not installed; using fallback validation.", file=sys.stderr)
+        _fallback_validate_agent_shape(obj)
+        return
+
+    try:
+        jsonschema.validate(instance=obj, schema=DEFAULT_AGENT_SCHEMA)
+    except jsonschema.exceptions.ValidationError as exc:
+        raise ValueError(f"Agent output does not match schema: {exc.message}") from exc
+
+
+def _fallback_validate_fuzzy_shape(obj: Dict[str, Any]) -> None:
     def req(k: str, t: Any) -> None:
         if k not in obj:
             raise ValueError(f"Missing required key: {k}")
@@ -534,6 +548,20 @@ def validate_fuzzy_shape(obj: Dict[str, Any]) -> None:
         for i, v in enumerate(obj[k]):
             if not isinstance(v, str):
                 raise ValueError(f"{k}[{i}] must be string")
+
+
+def validate_fuzzy_shape(obj: Dict[str, Any]) -> None:
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        print("Warning: 'jsonschema' not installed; using fallback validation.", file=sys.stderr)
+        _fallback_validate_fuzzy_shape(obj)
+        return
+
+    try:
+        jsonschema.validate(instance=obj, schema=DEFAULT_FUZZY_SCHEMA)
+    except jsonschema.exceptions.ValidationError as exc:
+        raise ValueError(f"Fuzzy review output does not match schema: {exc.message}") from exc
 
 
 # -----------------------------
@@ -587,7 +615,6 @@ class CodexAdapter:
 
         raw = read_text(last_msg_path)
         obj = parse_agent_json(raw)
-        validate_agent_shape(obj)
         return obj
 
 
@@ -618,7 +645,15 @@ class ClaudeAdapter:
 
         if self.output_format == "stream-json":
             lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-            stdout = lines[-1] if lines else ""
+            last_valid_line = ""
+            for line in reversed(lines):
+                try:
+                    json.loads(line)
+                    last_valid_line = line
+                    break
+                except json.JSONDecodeError:
+                    continue
+            stdout = last_valid_line
 
         # Best-effort unwrap
         try:
@@ -641,7 +676,6 @@ class ClaudeAdapter:
         except json.JSONDecodeError:
             obj = parse_agent_json(stdout)
 
-        validate_agent_shape(obj)
         write_text(out_path, json.dumps(obj, indent=2) + "\n")
         return obj
 
@@ -673,7 +707,6 @@ class CustomCommandAdapter:
             raise RuntimeError("Custom command did not produce {out_file} output.")
 
         obj = parse_agent_json(read_text(out_file))
-        validate_agent_shape(obj)
         return obj
 
 
@@ -999,6 +1032,21 @@ def run_fuzzy_review(
     return obj
 
 
+def run_agent_with_validation(
+    adapter: AgentAdapter,
+    prompt: str,
+    repo: Path,
+    out_dir: Path,
+    schema_path: Path,
+    output_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    agent_obj = adapter.run(prompt=prompt, repo=repo, out_dir=out_dir, schema_path=schema_path)
+    validate_agent_shape(agent_obj)
+    if output_path is not None:
+        write_json(output_path, agent_obj)
+    return agent_obj
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1141,7 +1189,14 @@ def main() -> int:
 
         # ---- Phase 1: agent works (initial attempt)
         try:
-            agent_obj = adapter.run(prompt=prompt, repo=repo, out_dir=iter_dir, schema_path=schema_path)
+            agent_obj = run_agent_with_validation(
+                adapter=adapter,
+                prompt=prompt,
+                repo=repo,
+                out_dir=iter_dir,
+                schema_path=schema_path,
+                output_path=iter_dir / "agent_output.json",
+            )
         except Exception as e:
             fail_counts[m.id] = fail_counts.get(m.id, 0) + 1
             write_text(iter_dir / "agent_error.txt", str(e))
@@ -1173,8 +1228,6 @@ def main() -> int:
             append_memory(memory_path, f"- Agent switched branches during {m.id} → forbid branch changes → controller reverted")
             memory = read_text(memory_path)
             continue
-
-        write_json(iter_dir / "agent_output.json", agent_obj)
 
         # Risk gate on diff size (staged+unstaged)
         changed_files = git_changed_files(repo)
@@ -1217,8 +1270,14 @@ def main() -> int:
             branch_before_fix = git_current_branch(repo)
 
             try:
-                agent_obj = adapter.run(prompt=fix_prompt, repo=repo, out_dir=fix_dir, schema_path=schema_path)
-                write_json(fix_dir / "agent_output.json", agent_obj)
+                agent_obj = run_agent_with_validation(
+                    adapter=adapter,
+                    prompt=fix_prompt,
+                    repo=repo,
+                    out_dir=fix_dir,
+                    schema_path=schema_path,
+                    output_path=fix_dir / "agent_output.json",
+                )
             except Exception as e:
                 write_text(fix_dir / "agent_error.txt", str(e))
                 print(f"Agent fix attempt failed: {e}", file=sys.stderr)
